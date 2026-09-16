@@ -31,9 +31,19 @@ deriveTensorSizes(Location loc, Value source, RankedTensorType resultType,
     if (allStaticSizes.size() != allMixedSizes.size())
       return failure();
 
-    for (auto [idx, staticSize] : llvm::enumerate(allStaticSizes)) {
-      if (staticSize == ShapedType::kDynamic || staticSize != 1)
-        mixedSizes.push_back(allMixedSizes[idx]);
+    // Keep exactly the dims the subview retains. Filtering on "size != 1"
+    // instead drops unit dims the result type still carries: a subview of sizes
+    // [1,1,1,?,1] producing memref<?x1xf16> retains two dims, but the filter
+    // yielded one, so the rank check below failed and this op was left as a
+    // generic bufferization.to_tensor. Downstream memory binding only matches
+    // loom.bufferize_to_tensor, so such loads were never bound to a buffer and
+    // their loom.semaphore_take was dead-code eliminated, which finally
+    // surfaced as "host CB emission requires at least one explicit
+    // loom.semaphore_take for each loom.alloc" in TT codegen.
+    llvm::SmallBitVector droppedDims = subview.getDroppedDims();
+    for (auto [idx, mixedSize] : llvm::enumerate(allMixedSizes)) {
+      if (!droppedDims.test(idx))
+        mixedSizes.push_back(mixedSize);
     }
   } else {
     auto sourceType = dyn_cast<MemRefType>(source.getType());
