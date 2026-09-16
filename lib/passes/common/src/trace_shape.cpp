@@ -103,13 +103,18 @@ SmallVector<SymbolicDim, 4> traceShape(Value v) {
   else if (auto toTensor = mlir::dyn_cast<bufferization::ToTensorOp>(op)) {
     Value memref = toTensor.getOperand();
     if (auto subview = memref.getDefiningOp<memref::SubViewOp>()) {
-      // Drop unit dims for rank-reducing subviews so the dim count matches
-      // the result tensor rank.
+      // Keep exactly the dims the subview actually retains, so the dim count
+      // matches the result tensor rank.
+      //
+      // Previously this filtered out every static 1, which is wrong whenever the
+      // result type keeps a unit dim: a subview of sizes [1,1,1,?,1] producing
+      // memref<?x1xf16> retains TWO dims, but filtering all the 1s yielded one.
+      // That silently produced rank-1 L1 allocations for what the frontend wrote
+      // as rank-2 [n,1] / [1,n] slices, which later passes reject.
       auto allSizes = subview.getMixedSizes();
-      ArrayRef<int64_t> allStaticSizes = subview.getStaticSizes();
+      llvm::SmallBitVector droppedDims = subview.getDroppedDims();
       for (size_t i = 0; i < allSizes.size(); ++i) {
-        int64_t s = allStaticSizes[i];
-        if (s == ShapedType::kDynamic || s != 1)
+        if (!droppedDims.test(i))
           rawDims.push_back(allSizes[i]);
       }
     } else {
