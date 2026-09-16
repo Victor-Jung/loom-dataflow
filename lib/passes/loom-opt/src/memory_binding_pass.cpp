@@ -58,7 +58,16 @@ struct ReadBlockLoadingLowering
 
   LogicalResult matchAndRewrite(loom::BufferizeToTensorOp op,
                                 PatternRewriter &rewriter) const override {
-    auto subviewOp = op.getSource().getDefiningOp<memref::SubViewOp>();
+    // Look through memref.cast. A statically-shaped subview feeding a
+    // dynamically-shaped tensor (e.g. memref<32x1xf16> -> memref<?x1xf16>) has a
+    // cast inserted between the subview and this op; without peeling it the
+    // match fails and the load is never bound to a buffer, which later shows up
+    // as "host CB emission requires at least one explicit loom.semaphore_take
+    // for each loom.alloc".
+    Value subviewSrc = op.getSource();
+    while (auto castOp = subviewSrc.getDefiningOp<memref::CastOp>())
+      subviewSrc = castOp.getSource();
+    auto subviewOp = subviewSrc.getDefiningOp<memref::SubViewOp>();
     if (!subviewOp)
       return failure();
 
@@ -77,7 +86,9 @@ struct ReadBlockLoadingLowering
 
     // 2. Create loom.subview — reuse the upstream memref.subview's result type
     //    verbatim (it is already rank-reduced when the subview is rank-reducing).
-    auto subviewResultType = cast<MemRefType>(subviewOp.getResult().getType());
+    // Use the type actually consumed here: identical to the subview's result
+    // when no cast intervened, and the post-cast type when one did.
+    auto subviewResultType = cast<MemRefType>(op.getSource().getType());
     auto loomSubviewOp = loom::SubviewOp::create(
         rewriter, loc, subviewResultType, subviewOp.getSource(),
         subviewOp.getOffsets(), subviewOp.getSizes(), subviewOp.getStrides(),
