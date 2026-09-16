@@ -437,19 +437,35 @@ private:
   void manageSemaphoreTakes() {
     for (const auto &[sig, bucket] : analysisCtx.getBuckets()) {
       for (const auto &vb : bucket.virtualBuffers) {
-        if (vb->members.empty())
+        const bool dbg = ::getenv("LOOM_DEBUG_BINDING") != nullptr;
+        if (vb->members.empty()) {
+          if (dbg)
+            llvm::errs() << "[loom] take SKIP vb=" << vb->id << " no members\n";
           continue;
+        }
 
         Value allocVal = colorToAlloc.lookup({sig, vb->color});
-        if (!allocVal)
+        if (!allocVal) {
+          if (dbg)
+            llvm::errs() << "[loom] take SKIP vb=" << vb->id
+                         << " color=" << vb->color << " no alloc for color\n";
           continue;
+        }
 
         // 1. Determine Take Ops
         int birthIdx = vb->liveness.birth;
         Operation *birthOp = analysisCtx.getOpFromIndex(birthIdx);
 
-        if (!birthOp)
+        if (!birthOp) {
+          if (dbg)
+            llvm::errs() << "[loom] take SKIP vb=" << vb->id
+                         << " birthIdx=" << birthIdx << " no birth op\n";
           continue;
+        }
+        if (dbg)
+          llvm::errs() << "[loom] take OK   vb=" << vb->id
+                       << " color=" << vb->color
+                       << " members=" << vb->members.size() << "\n";
 
         OpBuilder builder(context);
         Location loc = birthOp->getLoc();

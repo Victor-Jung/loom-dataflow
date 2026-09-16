@@ -1073,8 +1073,17 @@ MemoryAnalysisContext loom::runMemoryAnalysis(func::FuncOp func) {
 
         auto sig = utils::traceShape(res);
         // Allow empty sig (rank-0 tensor) through — still a valid signature.
-        if (sig.empty() && tensorType.getRank() != 0)
+        if (sig.empty() && tensorType.getRank() != 0) {
+          if (::getenv("LOOM_DEBUG_BINDING"))
+            llvm::errs() << "[loom] memory analysis SKIPS value (empty shape "
+                            "signature, rank " << tensorType.getRank() << "): "
+                         << *op << "\n";
           continue;
+        }
+        if (::getenv("LOOM_DEBUG_BINDING"))
+          llvm::errs() << "[loom] memory analysis tracks rank-"
+                       << tensorType.getRank() << " sig-dims " << sig.size()
+                       << " from " << op->getName() << "\n";
 
         ShapeSignature signature{sig, tensorType.getElementType()};
         ctx.addTensor(res, signature, op, ctx.getOpIndex(op),
