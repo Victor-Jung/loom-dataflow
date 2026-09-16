@@ -51,6 +51,15 @@ std::string locToString(mlir::Location loc) {
                << reason << "\n";
   llvm::errs() << "  alloc location: " << locToString(info.alloc_op->getLoc())
                << "\n";
+  // Diagnostic: the location alone points at the enclosing loop, which is not
+  // enough to identify which value produced the offending allocation.
+  // AllocInfo is passed by const ref, so only its plain members are usable here.
+  llvm::errs() << "  elem type     : " << info.elem_type << "\n";
+  llvm::errs() << "  rank          : " << info.static_sizes.size() << "\n";
+  llvm::errs() << "  static sizes  : [";
+  for (size_t i = 0; i < info.static_sizes.size(); ++i)
+    llvm::errs() << (i ? ", " : "") << info.static_sizes[i];
+  llvm::errs() << "]\n";
   assert(false && "L1 memory cannot align to hardware granularity (32x32)");
   llvm_unreachable("assert should have terminated");
 }
@@ -70,11 +79,23 @@ std::vector<AllocInfo> readAllL1Allocs(mlir::func::FuncOp funcOp) {
     if (allocOp.getMemory().getLeafReference() != "L1")
       return;
     auto memrefType = mlir::cast<mlir::MemRefType>(allocOp.getResult().getType());
+    std::vector<int64_t> sizes(allocOp.getStaticSizes().begin(),
+                               allocOp.getStaticSizes().end());
+    std::vector<Expr> dims = formatAllocDims(allocOp);
+    // A rank-1 L1 buffer reaches us because trace_shape drops unit dims from
+    // rank-reducing subviews (see trace_shape.cpp: "Drop unit dims for
+    // rank-reducing subviews"), so a [N, 1] slice arrives here as [N]. Restore
+    // the implicit trailing unit dim; applyBottom2Padding then pads it to the
+    // 32x32 tile granularity, which is the footprint such a buffer actually
+    // occupies. This is the same treatment an explicit static 1 already gets.
+    if (sizes.size() == 1) {
+      sizes.push_back(1);
+      dims.push_back(Expr::con(1));
+    }
     allocs.push_back(AllocInfo{
         allocOp,
-        std::vector<int64_t>(allocOp.getStaticSizes().begin(),
-                             allocOp.getStaticSizes().end()),
-        formatAllocDims(allocOp),
+        sizes,
+        dims,
         memrefType.getElementType(),
         Expr::none(),
     });
