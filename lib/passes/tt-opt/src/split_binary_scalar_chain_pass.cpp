@@ -3,12 +3,19 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h"
+#include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallPtrSet.h"
+
+#include "LoomDialect.h.inc"
+#include "LoomInterfaces.h.inc"
+#define GET_OP_CLASSES
+#include "LoomOps.h.inc"
 
 using namespace mlir;
 
@@ -142,6 +149,40 @@ void buildSecondBody(OpBuilder &builder, Location loc,
   builder.create<linalg::YieldOp>(loc, yielded);
 }
 
+
+/// Follow only aliasing edges (destination-passing inits and views) back to the
+/// buffer a value ultimately lives in. Unlike the general
+/// `traceToRootAllocOp`, this never crosses into an operand that merely feeds a
+/// computation, so two values compare equal here exactly when they share
+/// storage.
+Value rootBufferOf(Value value) {
+  SmallPtrSet<Operation *, 8> seen;
+  while (value) {
+    Operation *def = value.getDefiningOp();
+    if (!def || !seen.insert(def).second)
+      return value;
+    if (isa<loom::AllocOp>(def))
+      return value;
+    if (auto take = dyn_cast<loom::SemaphoreTakeOp>(def)) {
+      value = take->getOperand(0);
+      continue;
+    }
+    if (auto view = dyn_cast<ViewLikeOpInterface>(def)) {
+      value = view.getViewSource();
+      continue;
+    }
+    if (auto dps = dyn_cast<DestinationStyleOpInterface>(def)) {
+      auto result = dyn_cast<OpResult>(value);
+      if (result && result.getResultNumber() < dps.getNumDpsInits()) {
+        value = dps.getDpsInits()[result.getResultNumber()];
+        continue;
+      }
+    }
+    return value;
+  }
+  return value;
+}
+
 bool splitBinaryScalarChain(loom::utils::BinaryScalarChainMatch match,
                             RewriterBase &rewriter) {
   linalg::GenericOp genericOp = match.genericOp;
@@ -157,10 +198,58 @@ bool splitBinaryScalarChain(loom::utils::BinaryScalarChainMatch match,
       getInputMapsByIndex(genericOp, match.firstInputIndices);
   firstMaps.push_back(outputMap);
 
+  SmallVector<Value, 4> secondExtraInputs =
+      getInputsByIndex(genericOp, match.secondInputIndices);
+
+  // The split parks the chain's intermediate in the original destination. That
+  // is only safe when no other input of the second op lives in that same
+  // buffer: otherwise the first op's write destroys a value the second op still
+  // reads. This pass runs after bufferization, so nothing downstream will
+  // notice, and once lowered the buffer also takes two cb_push_back against a
+  // single cb_pop_front -- the packer then blocks forever in a cb_reserve_back
+  // that can never be satisfied. Give the intermediate its own buffer instead.
+  Value outputBuffer = rootBufferOf(output);
+  bool destAliasesInput =
+      outputBuffer && llvm::any_of(secondExtraInputs, [&](Value in) {
+        return rootBufferOf(in) == outputBuffer;
+      });
+
+  Value dest = output;
+  if (destAliasesInput) {
+    auto allocOp = outputBuffer.getDefiningOp<loom::AllocOp>();
+    auto memrefType = dyn_cast<MemRefType>(output.getType());
+    if (!allocOp || !memrefType)
+      return false; // cannot give it separate storage; leave the op fused
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointAfter(allocOp);
+    auto scratch = loom::AllocOp::create(
+        rewriter, allocOp.getLoc(), allocOp.getResult().getType(),
+        allocOp.getSizes(), allocOp.getStaticSizesAttr(),
+        allocOp.getAlignmentAttr(), allocOp.getBufferCountAttr(),
+        allocOp.getMemoryAttr());
+    dest = loom::SemaphoreTakeOp::create(rewriter, allocOp.getLoc(), memrefType,
+                                         scratch.getResult());
+  }
+
+  // Everything downstream of the chain wants the chain's result, which now
+  // lands in `dest`. Collect those uses while the original op still pins the
+  // program order.
+  SmallVector<OpOperand *, 4> usesToRedirect;
+  if (destAliasesInput) {
+    Block *block = genericOp->getBlock();
+    for (OpOperand &use : output.getUses()) {
+      Operation *owner = use.getOwner();
+      if (owner == genericOp || isa<loom::SemaphoreGiveOp>(owner))
+        continue;
+      Operation *ancestor = block->findAncestorOpInBlock(*owner);
+      if (ancestor && genericOp->isBeforeInBlock(ancestor))
+        usesToRedirect.push_back(&use);
+    }
+  }
+
   SmallVector<Value, 4> secondInputs;
-  secondInputs.push_back(output);
-  llvm::append_range(secondInputs,
-                     getInputsByIndex(genericOp, match.secondInputIndices));
+  secondInputs.push_back(dest);
+  llvm::append_range(secondInputs, secondExtraInputs);
 
   SmallVector<AffineMap, 4> secondMaps;
   secondMaps.push_back(outputMap);
@@ -171,18 +260,32 @@ bool splitBinaryScalarChain(loom::utils::BinaryScalarChainMatch match,
   Location loc = genericOp.getLoc();
   rewriter.setInsertionPoint(genericOp);
   rewriter.create<linalg::GenericOp>(
-      loc, firstInputs, ValueRange(output), firstMaps, iteratorTypes,
+      loc, firstInputs, ValueRange(dest), firstMaps, iteratorTypes,
       [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
         buildFirstBody(nestedBuilder, nestedLoc, match, args);
       });
 
   rewriter.create<linalg::GenericOp>(
-      loc, secondInputs, ValueRange(output), secondMaps, iteratorTypes,
+      loc, secondInputs, ValueRange(dest), secondMaps, iteratorTypes,
       [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
         buildSecondBody(nestedBuilder, nestedLoc, match, args);
       });
 
   rewriter.eraseOp(genericOp);
+
+  if (destAliasesInput) {
+    for (OpOperand *use : usesToRedirect)
+      use->set(dest);
+    // Release the new buffer wherever the original destination is released.
+    for (Operation *user : output.getUsers()) {
+      if (auto give = dyn_cast<loom::SemaphoreGiveOp>(user)) {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointAfter(give);
+        loom::SemaphoreGiveOp::create(rewriter, give.getLoc(), dest);
+        break;
+      }
+    }
+  }
   return true;
 }
 
