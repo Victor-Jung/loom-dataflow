@@ -9,6 +9,7 @@
 #include "LoomInterfaces.h.inc"
 #define GET_OP_CLASSES
 #include "LoomOps.h.inc"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -78,9 +79,51 @@ std::string formatElementType(mlir::Type elemType) {
   return typeStr;
 }
 
+static Expr traceIndexValueToExpr(mlir::Value val);
+
+/// Expand an affine expression into the symbolic Expr algebra, resolving dims
+static Expr traceAffineExprToExpr(mlir::AffineExpr expr,
+                                  mlir::ValueRange operands, unsigned numDims) {
+  using namespace mlir;
+  if (auto dim = llvm::dyn_cast<AffineDimExpr>(expr)) {
+    unsigned pos = dim.getPosition();
+    if (pos >= numDims || pos >= operands.size())
+      return Expr::none();
+    return traceIndexValueToExpr(operands[pos]);
+  }
+  if (auto sym = llvm::dyn_cast<AffineSymbolExpr>(expr)) {
+    unsigned pos = numDims + sym.getPosition();
+    if (pos >= operands.size())
+      return Expr::none();
+    return traceIndexValueToExpr(operands[pos]);
+  }
+  if (auto cst = llvm::dyn_cast<AffineConstantExpr>(expr))
+    return Expr::con(cst.getValue());
+  if (auto bin = llvm::dyn_cast<AffineBinaryOpExpr>(expr)) {
+    Expr lhs = traceAffineExprToExpr(bin.getLHS(), operands, numDims);
+    Expr rhs = traceAffineExprToExpr(bin.getRHS(), operands, numDims);
+    if (lhs.isNone() || rhs.isNone())
+      return Expr::none();
+    switch (bin.getKind()) {
+    case AffineExprKind::Add:
+      return lhs + rhs;
+    case AffineExprKind::Mul:
+      return lhs * rhs;
+    case AffineExprKind::Mod:
+    case AffineExprKind::FloorDiv:
+    case AffineExprKind::CeilDiv:
+      return lhs / rhs;
+    default:
+      return Expr::none();
+    }
+  }
+  return Expr::none();
+}
+
 /// Recursively trace an SSA index value to a symbolic Expr.
 /// Handles: loom.sym → Sym, arith.constant → Const,
-///          arith.ceildivui/si → Div, arith.muli → Mul, arith.addi → Add.
+///          arith.ceildivui/si → Div, arith.muli → Mul, arith.addi → Add,
+///          affine.apply → expanded affine expression.
 static Expr traceIndexValueToExpr(mlir::Value val) {
   using namespace mlir;
   if (!val)
@@ -117,6 +160,15 @@ static Expr traceIndexValueToExpr(mlir::Value val) {
   if (auto add = dyn_cast<arith::AddIOp>(op))
     return traceIndexValueToExpr(add.getLhs()) +
            traceIndexValueToExpr(add.getRhs());
+
+  // affine.apply → expand the map
+  if (auto apply = dyn_cast<affine::AffineApplyOp>(op)) {
+    mlir::AffineMap map = apply.getAffineMap();
+    if (map.getNumResults() == 1)
+      return traceAffineExprToExpr(map.getResult(0), apply.getOperands(),
+                                   map.getNumDims());
+    return Expr::none();
+  }
 
   // Type-conversion ops in the trip-count def-use chain are explicitly
   // unsupported.  Canonicalize/CSE should have removed them before ETG

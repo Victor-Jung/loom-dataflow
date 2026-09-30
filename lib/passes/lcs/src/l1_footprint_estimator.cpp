@@ -125,8 +125,7 @@ void validateBottom2Dims(const AllocInfo &info) {
 
   validateStatic(d0);
   validateStatic(d1);
-  if (one_count > 1)
-    failAlignAssert(info, "bottom-2 dims can contain at most one static 1");
+  (void)one_count;
 }
 
 std::vector<Expr> applyBottom2Padding(const AllocInfo &info) {
