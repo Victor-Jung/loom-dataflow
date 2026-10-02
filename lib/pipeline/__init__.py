@@ -3,6 +3,7 @@
 Provides safe, version-checked access to the two Loom C++ pipeline stages:
   - run_exploration():       stages 0-5 (tensor canonicalize → enumerate broadcast)
   - run_materialization():   stages 5-7 (materialize → OSB)
+  - run_mapping_tune():      stage 0 → tuned stage 0 (loop-tree search)
 
 All MLIR data flows as in-memory strings — no intermediate file I/O.  The
 caller decides when to persist strings to disk (e.g. for debugging).
@@ -128,4 +129,31 @@ def run_materialization(
     )
     if err:
         raise RuntimeError(f"Materialization pipeline failed: {err}")
+    return output_mlir
+
+
+def run_mapping_tune(
+    input_mlir: str,
+    policy: str = "identity",
+    options: str = "",
+) -> str:
+    """Tune a mapping program (stage 00 MLIR) with a search policy.
+
+    Args:
+        input_mlir: Input MLIR text (stage 00, from the Helion frontend).
+        policy:     Search policy name ("identity", "fixed", ...).
+        options:    Policy options; for "fixed" the schedule string, e.g.
+                    ``"interchange(m,n)"``.
+
+    Returns:
+        Output MLIR text, again a stage 00 program.
+
+    Raises:
+        RuntimeError: If the C++ pass fails (illegal schedule, unknown policy).
+    """
+    err, output_mlir = _loom_pipeline.run_mapping_tune_pipeline(
+        input_mlir, policy, options
+    )
+    if err:
+        raise RuntimeError(err)
     return output_mlir

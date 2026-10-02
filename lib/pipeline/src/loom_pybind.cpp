@@ -3,6 +3,7 @@
 /// Exposes two pipeline functions and a version string:
 ///   - run_exploration_pipeline(...)   → stages 0-5
 ///   - run_materialization_pipeline(...) → stages 5-7
+///   - run_mapping_tune_pipeline(...)    → stage 0 → tuned stage 0
 ///   - __version__                     → compile-time version from CMake
 
 #include <pybind11/pybind11.h>
@@ -11,6 +12,7 @@
 #include "loom_version.h"
 #include "loom_exploration_pipeline.h"
 #include "loom_materialization_pipeline.h"
+#include "loom_mapping_tune_pipeline.h"
 
 namespace py = pybind11;
 
@@ -66,6 +68,28 @@ PYBIND11_MODULE(_loom_pipeline, m) {
       Returns:
           Tuple of (error, output_mlir).
           error is empty on success.
+      )doc",
+      py::call_guard<py::gil_scoped_release>());
+
+  m.def(
+      "run_mapping_tune_pipeline",
+      &loom::pipeline::runMappingTunePipeline,
+      py::arg("input_mlir_text"),
+      py::arg("policy") = "identity",
+      py::arg("options") = "",
+      R"doc(Tune a mapping program (stage 00 MLIR) with a search policy.
+
+      Runs the loom-tune-mapping-program pass on every function and returns
+      a stage 00 program accepted by run_exploration_pipeline.
+
+      Args:
+          input_mlir_text: Input MLIR as a string (stage 00).
+          policy: Search policy name ("identity", "fixed", ...).
+          options: Policy options; for "fixed" the schedule string, e.g.
+              "interchange(m,n)".
+
+      Returns:
+          Tuple of (error, output_mlir). error is empty on success.
       )doc",
       py::call_guard<py::gil_scoped_release>());
 }

@@ -6,6 +6,7 @@ add_subdirectory(resources)
 add_subdirectory(modules)
 add_subdirectory(analysis)
 add_subdirectory(passes)
+add_subdirectory(tune)
 add_subdirectory(loom-dialect)
 add_subdirectory(pipeline)
 

@@ -14,6 +14,7 @@ set(LOOM_PIPELINE_INCLUDES
     ${CMAKE_SOURCE_DIR}/lib/passes
     ${CMAKE_SOURCE_DIR}/lib/passes/common/inc
     ${CMAKE_SOURCE_DIR}/lib/passes/lcs/inc
+    ${CMAKE_SOURCE_DIR}/lib/tune/inc
     ${CMAKE_BINARY_DIR}/lib/passes/loom-opt
     ${CMAKE_BINARY_DIR}/lib/passes/tt-opt
     # Dialect generated headers
@@ -27,6 +28,7 @@ set(LOOM_PIPELINE_INCLUDES
 # Union of all MLIR/Loom link libraries needed by both pipelines
 set(LOOM_PIPELINE_LIBS
     loomTritonSharedPasses
+    loomTune
     loomTTOptPasses
     loomDialectTransforms
     loomDialect
@@ -70,6 +72,7 @@ set(LOOM_PIPELINE_LIBS
 add_library(loom_pipeline_core STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/loom_materialization_pipeline.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/loom_exploration_pipeline.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/loom_mapping_tune_pipeline.cpp
 )
 
 target_include_directories(loom_pipeline_core PRIVATE ${LOOM_PIPELINE_INCLUDES})
