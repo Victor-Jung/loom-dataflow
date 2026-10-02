@@ -239,50 +239,40 @@ void MemoryAnalysisContext::collectExclusiveHandoffTargets(func::FuncOp func) {
   });
 }
 
-std::optional<LoopContext> MemoryAnalysisContext::findLoopContext() const {
-  SmallVector<scf::ForOp, 4> loopCarriedForOps;
+SmallVector<Operation *> MemoryAnalysisContext::collectLoops() const {
+  SmallVector<Operation *> loops;
+  for (Operation *op : indexToOpMap_)
+    if (op && isa<scf::ForOp, affine::AffineForOp>(op))
+      loops.push_back(op);
+  return loops;
+}
 
-  for (auto &entry : opIndexMap_) {
-    auto parallelOp = mlir::dyn_cast<affine::AffineParallelOp>(entry.first);
-    if (!parallelOp)
+SmallVector<LoopContext>
+MemoryAnalysisContext::collectCarriedLoopContexts() const {
+  SmallVector<LoopContext> contexts;
+  for (Operation *op : collectLoops()) {
+    bool carried = false;
+    if (auto forOp = dyn_cast<scf::ForOp>(op))
+      carried = !forOp.getInitArgs().empty();
+    else if (auto forOp = dyn_cast<affine::AffineForOp>(op))
+      carried = forOp.getNumIterOperands() != 0;
+    if (!carried)
       continue;
-
-    parallelOp.walk([&](scf::ForOp forOp) {
-      if (!forOp.getInitArgs().empty())
-        loopCarriedForOps.push_back(forOp);
-    });
-  }
-
-  if (loopCarriedForOps.size() != 1) {
-    llvm::errs() << "memory analysis expects exactly one loop-carried scf.for, "
-                 << "found " << loopCarriedForOps.size() << "\n";
-    assert(false && "memory analysis expects exactly one loop-carried scf.for");
-    llvm::report_fatal_error(
-        "memory analysis expects exactly one loop-carried scf.for");
-  }
-
-  scf::ForOp loopCarriedForOp = loopCarriedForOps.front();
-  bool hasNestedLoop = false;
-  loopCarriedForOp.getBody()->walk([&](Operation *op) {
-    if (isa<scf::ForOp, affine::AffineForOp>(op)) {
-      hasNestedLoop = true;
-      return WalkResult::interrupt();
+    int startIndex = getOpIndex(op);
+    if (startIndex < 0) {
+      op->emitError("loop-carried loop missing operation index");
+      llvm::report_fatal_error("loop-carried loop missing operation index");
     }
-    return WalkResult::advance();
+    contexts.push_back(LoopContext{op, startIndex, getLoopEndIndex(op)});
+  }
+  // Innermost first, so each loop fuses its own init/iter_arg/yield/result
+  // before an enclosing loop sees them.
+  llvm::stable_sort(contexts, [](const LoopContext &x, const LoopContext &y) {
+    return x.loopOp->isAncestor(y.loopOp) ? false
+           : y.loopOp->isAncestor(x.loopOp) ? true
+                                            : x.startIndex > y.startIndex;
   });
-  if (hasNestedLoop) {
-    assert(false && "loop-carried scf.for must be innermost");
-    llvm::report_fatal_error("loop-carried scf.for must be innermost");
-  }
-
-  int startIndex = getOpIndex(loopCarriedForOp);
-  if (startIndex < 0) {
-    assert(false && "loop-carried scf.for missing operation index");
-    llvm::report_fatal_error("loop-carried scf.for missing operation index");
-  }
-
-  return LoopContext{loopCarriedForOp.getOperation(), startIndex,
-                     getLoopEndIndex(loopCarriedForOp)};
+  return contexts;
 }
 
 // ============================================================================
@@ -427,32 +417,47 @@ void MemoryAnalysisContext::applyPhiFusionAxiom(
   }
 }
 
-void MemoryAnalysisContext::applyExternalEternityAxiom(
-    Bucket &bucket, const LoopContext &loopContext) {
-  Operation *loopOp = loopContext.loopOp;
-  for (auto &node : bucket.nodes) {
-    if (node.mappedVBId.has_value())
+/// Index of the last op of the outermost loop in `loops` that contains a use
+/// of `v` but not its definition, or -1 when `v` crosses no loop boundary.
+static int crossedLoopEnd(const MemoryAnalysisContext &ctx, Value v,
+                          Operation *defOp, ArrayRef<Operation *> loops) {
+  int end = -1;
+  for (Operation *loop : loops) {
+    if (loop->isAncestor(defOp))
       continue;
-
-    // DefiningOp is outside loop
-    if (loopOp->isProperAncestor(node.definingOp))
-      continue;
-
-    // At least one user inside loop
-    bool usedInLoop = false;
-    for (auto &use : node.value.getUses()) {
-      if (loopOp->isProperAncestor(use.getOwner())) {
-        usedInLoop = true;
+    for (OpOperand &use : v.getUses()) {
+      if (loop->isAncestor(use.getOwner())) {
+        end = std::max(end, ctx.getLoopEndIndex(loop));
         break;
       }
     }
-    if (!usedInLoop)
-      continue;
+  }
+  return end;
+}
 
+void MemoryAnalysisContext::applyExternalEternityAxiom(
+    Bucket &bucket, ArrayRef<Operation *> loops) {
+  for (auto &node : bucket.nodes) {
+    if (node.mappedVBId.has_value())
+      continue;
+    int end = crossedLoopEnd(*this, node.value, node.definingOp, loops);
+    if (end < 0)
+      continue;
     VirtualBuffer *vb = bucket.createVB(nextVBId_++, VBType::Eternal);
     vb->addMember(&node);
-    vb->liveness = {node.linearIndex, loopContext.endIndex};
+    vb->liveness = {node.linearIndex, std::max(end, node.deathIndex)};
     vb->updateDefiningOp();
+  }
+}
+
+void MemoryAnalysisContext::extendLivenessOverLoops(
+    Bucket &bucket, ArrayRef<Operation *> loops) {
+  for (auto &vb : bucket.virtualBuffers) {
+    for (TensorNode *member : vb->members) {
+      int end = crossedLoopEnd(*this, member->value, member->definingOp, loops);
+      if (end > vb->liveness.death)
+        vb->liveness.death = end;
+    }
   }
 }
 
@@ -469,15 +474,16 @@ void MemoryAnalysisContext::applyStandardAxiom(Bucket &bucket) {
 }
 
 void MemoryAnalysisContext::buildVirtualBuffers() {
-  auto loopOpt = findLoopContext();
+  SmallVector<LoopContext> carried = collectCarriedLoopContexts();
+  SmallVector<Operation *> loops = collectLoops();
 
   for (auto &[sig, bucket] : buckets_) {
     applyNonDefaultLocalMemoryKindAxiom(bucket);
-    if (loopOpt) {
-      applyPhiFusionAxiom(bucket, *loopOpt);
-      applyExternalEternityAxiom(bucket, *loopOpt);
-    }
+    for (const LoopContext &loop : carried)
+      applyPhiFusionAxiom(bucket, loop);
+    applyExternalEternityAxiom(bucket, loops);
     applyStandardAxiom(bucket);
+    extendLivenessOverLoops(bucket, loops);
     assignExclusiveTargetAttributes(bucket);
   }
 }

@@ -272,14 +272,20 @@ private:
   LoomAllocationPlan allocationPlan_;
 
   // --- Internal Helpers ---
-  std::optional<LoopContext> findLoopContext() const;
+  /// Loop-carried loops of the function, innermost first.
+  llvm::SmallVector<LoopContext> collectCarriedLoopContexts() const;
+  /// Every scf.for / affine.for of the function.
+  llvm::SmallVector<mlir::Operation *> collectLoops() const;
   void markExclusiveTarget(mlir::Value target, mlir::Operation *anchor,
                            llvm::StringRef reason);
   bool isExclusiveTarget(mlir::Value value) const;
   void assignExclusiveTargetAttributes(Bucket &bucket);
   void applyNonDefaultLocalMemoryKindAxiom(Bucket &bucket);
   void applyPhiFusionAxiom(Bucket &bucket, const LoopContext &loop);
-  void applyExternalEternityAxiom(Bucket &bucket, const LoopContext &loop);
+  void applyExternalEternityAxiom(Bucket &bucket,
+                                  llvm::ArrayRef<mlir::Operation *> loops);
+  void extendLivenessOverLoops(Bucket &bucket,
+                               llvm::ArrayRef<mlir::Operation *> loops);
   void applyStandardAxiom(Bucket &bucket);
 };
 

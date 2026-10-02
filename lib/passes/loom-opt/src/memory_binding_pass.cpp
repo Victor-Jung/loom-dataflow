@@ -503,15 +503,15 @@ private:
         Operation *insertionPoint = deathOp;
         bool insertAfter = true;
 
-        // Scope hoisting: For Eternal and Fused VBs, their lifetime spans
-        // across inner loop iterations. If their last use (deathOp) is inside a
-        // nested loop, we must hoist their death to after that loop, instead of
-        // killing them inside.
-        if (vb->type == VBType::Eternal || vb->type == VBType::Fused) {
-          while (insertionPoint->getParentOp() != bucket.scopeOp) {
-            insertionPoint = insertionPoint->getParentOp();
-            insertAfter = true;
-          }
+        // A buffer last used inside a loop that does not contain its birth is
+        // live across that loop's iterations: release it after the loop, and
+        // after every enclosing loop that also excludes the birth.
+        Operation *birthOp = analysisCtx.getOpFromIndex(vb->liveness.birth);
+        while (Operation *parent = insertionPoint->getParentOp()) {
+          if (parent == bucket.scopeOp || !birthOp || parent->isAncestor(birthOp))
+            break;
+          insertionPoint = parent;
+          insertAfter = true;
         }
 
         // Terminator guard: never insert AFTER a terminator
@@ -532,29 +532,11 @@ private:
   }
 
   void resolveBucketScopes() {
-    llvm::DenseMap<Operation *, Operation *> normalizedScopeCache;
     for (auto &[sig, bucket] : analysisCtx.getBucketsMutable()) {
-      if (bucket.nodes.empty())
-        continue;
-
-      Operation *op = bucket.nodes.front().definingOp;
-      while (op && !isa<affine::AffineParallelOp>(op))
-        op = op->getParentOp();
-      auto parallelOp = dyn_cast_or_null<affine::AffineParallelOp>(op);
-      if (!parallelOp) {
-        bucket.scopeOp = nullptr;
-        continue;
-      }
-
-      Operation *parallelRaw = parallelOp.getOperation();
-      auto cachedIt = normalizedScopeCache.find(parallelRaw);
-      if (cachedIt == normalizedScopeCache.end()) {
-        Operation *normalizedScope =
-            loom::utils::getNormalizedMemoryBindingScope(parallelOp);
-        cachedIt =
-            normalizedScopeCache.insert({parallelRaw, normalizedScope}).first;
-      }
-      bucket.scopeOp = cachedIt->second;
+      SmallVector<Operation *> defs;
+      for (const TensorNode &node : bucket.nodes)
+        defs.push_back(node.definingOp);
+      bucket.scopeOp = loom::utils::getMemoryBindingScope(defs);
     }
   }
 

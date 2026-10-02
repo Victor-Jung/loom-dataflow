@@ -61,15 +61,15 @@ llvm::SmallVector<AllocInfo> collectL1AllocInfos(mlir::func::FuncOp func);
 llvm::StringRef traceToSymbolicVar(mlir::Value val);
 
 /**
- * @brief Return the memory-binding scope for a validated loop nest.
+ * @brief Return the memory-binding scope of a set of tensor definitions.
  *
- * The input must contain exactly one loop-carried scf.for. If that loop is
- * wrapped by a supported perfectly-nested serial scf.for envelope, the returned
- * scope is the loop-carried for's immediate parent. Otherwise the original
- * affine.parallel is returned. Unsupported nest shapes report a fatal error.
+ * The scope is the deepest affine.parallel or non-loop-carried scf.for whose
+ * body contains every defining op. Loop-carried loops are not entered: a
+ * buffer born inside one is scoped to the loop's parent. Returns nullptr when
+ * the definitions are not under a common affine.parallel.
  */
 mlir::Operation *
-getNormalizedMemoryBindingScope(mlir::affine::AffineParallelOp parallelOp);
+getMemoryBindingScope(llvm::ArrayRef<mlir::Operation *> definingOps);
 
 /**
  * @brief Generate partial-hardware occupancy views.

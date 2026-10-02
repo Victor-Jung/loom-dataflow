@@ -183,188 +183,20 @@ generateHardwareOccupancyVariants(const HardwareInfo &hardwareInfo) {
 
 namespace {
 
-bool hasRankedTensorInitArg(scf::ForOp forOp) {
-  return llvm::any_of(forOp.getInitArgs(), [](Value initArg) {
-    return isa<RankedTensorType>(initArg.getType());
-  });
+/// The nearest enclosing affine.parallel or non-loop-carried scf.for.
+Operation *memoryBindingContainer(Operation *op) {
+  Operation *p = op->getParentOp();
+  while (p) {
+    if (isa<affine::AffineParallelOp>(p))
+      return p;
+    if (auto forOp = dyn_cast<scf::ForOp>(p))
+      if (forOp.getInitArgs().empty())
+        return p;
+    p = p->getParentOp();
+  }
+  return nullptr;
 }
 
-scf::ForOp findUniqueLoopCarriedForOrFail(affine::AffineParallelOp parallelOp) {
-  SmallVector<scf::ForOp, 2> loopCarriedForOps;
-  parallelOp.walk([&](scf::ForOp forOp) {
-    if (!forOp.getInitArgs().empty())
-      loopCarriedForOps.push_back(forOp);
-  });
-
-  if (loopCarriedForOps.size() != 1) {
-    parallelOp.emitError()
-        << "memory binding expects exactly one loop-carried scf.for under "
-           "affine.parallel, found "
-        << loopCarriedForOps.size();
-    assert(false && "invalid loop-carried scf.for count");
-    llvm::report_fatal_error("invalid loop-carried scf.for count");
-  }
-
-  scf::ForOp loopCarriedFor = loopCarriedForOps.front();
-  if (!hasRankedTensorInitArg(loopCarriedFor)) {
-    loopCarriedFor.emitError()
-        << "memory binding expects the unique loop-carried scf.for to carry "
-           "at least one ranked tensor iter_arg";
-    assert(false && "loop-carried scf.for has no ranked tensor iter_arg");
-    llvm::report_fatal_error(
-        "loop-carried scf.for has no ranked tensor iter_arg");
-  }
-
-  return loopCarriedFor;
-}
-
-bool isAllowedLoopNestPrefixOp(Operation *op) {
-  if (op->getNumRegions() != 0)
-    return false;
-  if (!isMemoryEffectFree(op))
-    return false;
-  if (op->getNumResults() == 0)
-    return false;
-  return llvm::all_of(op->getResults(), [](Value result) {
-    Type type = result.getType();
-    return type.isIndex() || isa<IntegerType>(type);
-  });
-}
-
-void validateLoopCarriedForIsInnermost(scf::ForOp loopCarriedFor) {
-  bool hasNestedLoop = false;
-  loopCarriedFor.getBody()->walk([&](Operation *op) {
-    if (isa<scf::ForOp, affine::AffineForOp>(op)) {
-      hasNestedLoop = true;
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  if (hasNestedLoop) {
-    loopCarriedFor.emitError()
-        << "loop-carried scf.for must be the innermost loop for memory binding";
-    assert(false && "loop-carried scf.for must be innermost");
-    llvm::report_fatal_error("loop-carried scf.for must be innermost");
-  }
-
-  unsigned yieldCount = 0;
-  loopCarriedFor.getBody()->walk([&](scf::YieldOp yieldOp) {
-    ++yieldCount;
-    return WalkResult::advance();
-  });
-  auto yieldOp =
-      dyn_cast<scf::YieldOp>(loopCarriedFor.getBody()->getTerminator());
-  if (yieldCount != 1 || !yieldOp) {
-    loopCarriedFor.emitError()
-        << "loop-carried scf.for must have exactly one scf.yield terminator";
-    assert(false && "loop-carried scf.for must have exactly one yield");
-    llvm::report_fatal_error(
-        "loop-carried scf.for must have exactly one yield");
-  }
-}
-
-void validateSingleChildLoopContainer(Operation *container,
-                                      scf::ForOp expectedChild) {
-  if (container->getNumRegions() != 1 ||
-      !llvm::hasSingleElement(container->getRegion(0))) {
-    container->emitError()
-        << "memory binding loop-nest validation expects a single-block region";
-    assert(false && "unsupported loop container shape");
-    llvm::report_fatal_error("unsupported loop container shape");
-  }
-
-  bool sawChild = false;
-  unsigned childLoopCount = 0;
-  Block &body = container->getRegion(0).front();
-  for (Operation &bodyOp : body) {
-    Operation *op = &bodyOp;
-    if (op->hasTrait<OpTrait::IsTerminator>())
-      continue;
-
-    if (op == expectedChild.getOperation()) {
-      sawChild = true;
-      ++childLoopCount;
-      continue;
-    }
-
-    if (isa<scf::ForOp, affine::AffineForOp>(op)) {
-      container->emitError()
-          << "memory binding requires exactly one child loop at each "
-             "supported serial nest level";
-      assert(false && "unsupported non-perfect loop nest");
-      llvm::report_fatal_error("unsupported non-perfect loop nest");
-    }
-
-    if (!sawChild) {
-      if (isAllowedLoopNestPrefixOp(op))
-        continue;
-      op->emitError()
-          << "only side-effect-free index/integer bound computations may "
-             "precede the child loop in a memory-binding serial envelope";
-      assert(false && "unsupported pre-loop operation in serial envelope");
-      llvm::report_fatal_error(
-          "unsupported pre-loop operation in serial envelope");
-    }
-
-    op->emitError() << "no non-terminator operations may follow the child loop "
-                       "in a memory-binding serial envelope";
-    assert(false && "unsupported post-loop operation in serial envelope");
-    llvm::report_fatal_error(
-        "unsupported post-loop operation in serial envelope");
-  }
-
-  if (!sawChild || childLoopCount != 1) {
-    container->emitError()
-        << "memory binding serial envelope must contain the expected child "
-           "loop exactly once";
-    assert(false && "expected child loop missing from serial envelope");
-    llvm::report_fatal_error(
-        "expected child loop missing from serial envelope");
-  }
-}
-
-void validateLoopNestPathOrFail(affine::AffineParallelOp parallelOp,
-                                scf::ForOp loopCarriedFor) {
-  validateLoopCarriedForIsInnermost(loopCarriedFor);
-
-  // The loop-carried loop's immediate parent is the normalized compute scope.
-  // It may contain regular compute before and after the carried loop. Only the
-  // serial envelope outside that scope must be perfectly nested.
-  Operation *normalizedScope = loopCarriedFor->getParentOp();
-  if (normalizedScope == parallelOp.getOperation())
-    return;
-
-  auto scopeFor = dyn_cast_or_null<scf::ForOp>(normalizedScope);
-  if (!scopeFor) {
-    loopCarriedFor.emitError()
-        << "loop-carried scf.for must be directly enclosed by either an "
-           "outer scf.for normalized scope or the affine.parallel";
-    assert(false && "unsupported loop-carried parent scope");
-    llvm::report_fatal_error("unsupported loop-carried parent scope");
-  }
-
-  scf::ForOp child = scopeFor;
-  Operation *parent = child->getParentOp();
-  while (parent != parallelOp.getOperation()) {
-    auto parentFor = dyn_cast_or_null<scf::ForOp>(parent);
-    if (!parentFor) {
-      loopCarriedFor.emitError()
-          << "normalized memory scope must be enclosed only by scf.for ops "
-             "between itself and the affine.parallel";
-      assert(false && "unsupported non-scf parent in serial envelope");
-      llvm::report_fatal_error(
-          "unsupported non-scf parent in serial envelope");
-    }
-    validateSingleChildLoopContainer(parent, child);
-    child = parentFor;
-    parent = child->getParentOp();
-  }
-
-  validateSingleChildLoopContainer(parallelOp.getOperation(), child);
-}
-
-/// Returns the L1 alloc's element Type by inspecting its tensor-side users.
-/// Returns null Type if no compatible user exists.
 Type findL1AllocElementType(loom::AllocOp alloc) {
   for (auto user : alloc.getResult().getUsers()) {
     if (auto init = dyn_cast<loom::InitTensorOp>(user))
@@ -454,14 +286,23 @@ void cancelHoistedDivPairs(
 } // namespace
 
 Operation *
-getNormalizedMemoryBindingScope(affine::AffineParallelOp parallelOp) {
-  scf::ForOp loopCarriedFor = findUniqueLoopCarriedForOrFail(parallelOp);
-  validateLoopNestPathOrFail(parallelOp, loopCarriedFor);
-
-  Operation *parent = loopCarriedFor->getParentOp();
-  if (isa<scf::ForOp>(parent))
-    return parent;
-  return parallelOp.getOperation();
+getMemoryBindingScope(llvm::ArrayRef<Operation *> definingOps) {
+  Operation *scope = nullptr;
+  for (Operation *def : definingOps) {
+    Operation *container = memoryBindingContainer(def);
+    if (!container)
+      return nullptr;
+    if (!scope) {
+      scope = container;
+      continue;
+    }
+    while (scope != container && !scope->isAncestor(container)) {
+      scope = memoryBindingContainer(scope);
+      if (!scope)
+        return nullptr;
+    }
+  }
+  return scope;
 }
 
 llvm::SmallVector<AllocInfo> collectL1AllocInfos(func::FuncOp func) {
