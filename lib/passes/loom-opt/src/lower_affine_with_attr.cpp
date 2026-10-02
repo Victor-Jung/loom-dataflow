@@ -87,40 +87,61 @@ struct LowerAffineWithAttrPass
     SmallVector<Attribute> blockSyms;
     bool hasAnyAttr = false;
 
+    // Single-iteration dimensions are folded, but a spatially mapped nest
+    // keeps at least one dimension: a mapping with no loop left has no
+    // mapping. The upstream scf.parallel canonicalizer would also fold these
+    // dims, rebuilding the op without its attributes, so the pipeline must
+    // not run it after this pass (see CanonicalizeExceptParallelPass).
+    struct DimRef {
+      affine::AffineParallelOp par;
+      unsigned i;
+      bool fold;
+    };
+    SmallVector<DimRef> dims;
+    bool nestIsMapped = false;
     for (auto parOp : nest) {
+      auto constantRanges = parOp.getConstantRanges();
+      if (parOp->getAttr("loom.physical_dim"))
+        nestIsMapped = true;
+      for (unsigned i = 0; i < parOp.getNumDims(); ++i) {
+        bool fold = constantRanges && (*constantRanges)[i] > 0 &&
+                    (*constantRanges)[i] <= parOp.getSteps()[i];
+        dims.push_back({parOp, i, fold});
+      }
+    }
+    if (nestIsMapped && !dims.empty() &&
+        llvm::all_of(dims, [](const DimRef &d) { return d.fold; }))
+      dims.front().fold = false;
+
+    for (const DimRef &d : dims) {
+      auto parOp = d.par;
+      unsigned i = d.i;
       auto pd = parOp->getAttr("loom.physical_dim");
       auto ll = parOp->getAttr("loom.logical_level");
       auto it = parOp->getAttr("loom.iter_type");
       auto bs = parOp->getAttr("loom.block_sym");
-      auto constantRanges = parOp.getConstantRanges();
 
-      for (unsigned i = 0; i < parOp.getNumDims(); ++i) {
-        // Lower bounds using affine.apply (temporary, will be lowered later)
-        Value lowerBound = affine::AffineApplyOp::create(
-            builder, loc, parOp.getLowerBoundMap(i),
-            parOp.getLowerBoundsOperands());
+      // Lower bounds using affine.apply (temporary, will be lowered later)
+      Value lowerBound = affine::AffineApplyOp::create(
+          builder, loc, parOp.getLowerBoundMap(i),
+          parOp.getLowerBoundsOperands());
 
-        // Fold single-iteration affine.parallel dimensions before creating
-        // scf.parallel. The upstream scf.parallel canonicalizer also folds
-        // these dims, but rebuilds the op without preserving discardable attrs.
-        if (constantRanges && (*constantRanges)[i] > 0 &&
-            (*constantRanges)[i] <= parOp.getSteps()[i]) {
-          mapping.map(parOp.getBody()->getArgument(i), lowerBound);
-          continue;
-        }
-
-        lowerBounds.push_back(lowerBound);
-        upperBounds.push_back(affine::AffineApplyOp::create(
-            builder, loc, parOp.getUpperBoundMap(i),
-            parOp.getUpperBoundsOperands()));
-        steps.push_back(arith::ConstantIndexOp::create(
-            builder, loc, parOp.getSteps()[i]));
-
-        physicalDims.push_back(pd ? pd : builder.getUnitAttr());
-        logicalLevels.push_back(ll ? ll : builder.getUnitAttr());
-        iterTypes.push_back(it ? it : builder.getUnitAttr());
-        blockSyms.push_back(bs ? bs : builder.getUnitAttr());
+      if (d.fold) {
+        mapping.map(parOp.getBody()->getArgument(i), lowerBound);
+        continue;
       }
+
+      lowerBounds.push_back(lowerBound);
+      upperBounds.push_back(affine::AffineApplyOp::create(
+          builder, loc, parOp.getUpperBoundMap(i),
+          parOp.getUpperBoundsOperands()));
+      steps.push_back(arith::ConstantIndexOp::create(
+          builder, loc, parOp.getSteps()[i]));
+
+      physicalDims.push_back(pd ? pd : builder.getUnitAttr());
+      logicalLevels.push_back(ll ? ll : builder.getUnitAttr());
+      iterTypes.push_back(it ? it : builder.getUnitAttr());
+      blockSyms.push_back(bs ? bs : builder.getUnitAttr());
       if (pd || ll || it || bs)
         hasAnyAttr = true;
     }

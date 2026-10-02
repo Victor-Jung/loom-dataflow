@@ -26,6 +26,7 @@ add_library(loomTritonSharedPasses STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/memory_binding_pass.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/view_to_reinterpret_cast.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/lower_affine_with_attr.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/canonicalize_except_parallel_pass.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/handoff_sync_insertion_pass.cpp
 )
 
@@ -52,6 +53,7 @@ target_link_libraries(loomTritonSharedPasses PUBLIC
     MLIRSCFDialect
     MLIRBufferizationDialect
     MLIRBufferizationTransforms
+    MLIRTransforms
     MLIRAsmParser
     MLIRBytecodeReader
     ADLDialect::IR

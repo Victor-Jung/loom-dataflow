@@ -299,8 +299,10 @@ runMaterializationCore(const char *input_mlir_text,
   pm.nest<ModuleOp>().addPass(
       bufferization::createOneShotBufferizePass(osbOptions));
 
-  // Stage 5: Final cleanup (matches one_shot_bufferize single-stage driver)
-  pm.addPass(mlir::createCanonicalizerPass());
+  // Stage 5: Final cleanup (matches one_shot_bufferize single-stage driver).
+  // From here on scf.parallel carries the spatial mapping; the upstream
+  // canonicalizer would fold single-iteration dims and drop it.
+  pm.addPass(loom::passes::createCanonicalizeExceptParallelPass());
   pm.addPass(mlir::createCSEPass());
   pm.addPass(loom::passes::createLowerLinalgCopyToLoomCopyPass());
 
@@ -311,7 +313,7 @@ runMaterializationCore(const char *input_mlir_text,
   pm.addPass(loom::passes::createConvertZeroFillLinalgMatmulToLoomPass());
   pm.addPass(loom::passes::createFoldZeroFillLinalgPass());
   pm.addPass(loom::passes::createSplitBinaryScalarChainPass());
-  pm.addPass(mlir::createCanonicalizerPass());
+  pm.addPass(loom::passes::createCanonicalizeExceptParallelPass());
 
   // --- Run pipeline ---
   if (failed(pm.run(*module)))
